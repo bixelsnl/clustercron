@@ -22,15 +22,15 @@ logger = logging.getLogger(__name__)
 
 
 class Alb(Lb):
-    def _get_target_health(self):
-        target_health = []
-        logger.debug("Get instance health states")
+    def _get_target_group_info(self):
+        """Get target group information including ARN and target type"""
+        target_group_info = {}
         try:
             client = boto3.client("elbv2")
         except NoRegionError as error:
             if self.region_name is None:
                 logger.error("%s", error)
-                return target_health
+                return target_group_info
             else:
                 client = boto3.client(
                     "elbv2",
@@ -46,40 +46,95 @@ class Alb(Lb):
             )
         else:
             try:
-                targetgroup_arn = targetgroups.get("TargetGroups")[0][
-                    "TargetGroupArn"
-                ]
+                target_group = targetgroups.get("TargetGroups")[0]
+                target_group_info["arn"] = target_group["TargetGroupArn"]
+                target_group_info["type"] = target_group["TargetType"]
+                logger.info("Target group type: %s", target_group_info["type"])
             except Exception as error:
                 logger.error(
-                    "Could not get TargetGroupArn for `%s`: %s",
+                    "Could not get TargetGroup info for `%s`: %s",
                     self.name,
                     error,
                 )
+        return target_group_info
+        
+    def _get_target_health(self):
+        target_health = []
+        logger.debug("Get target health states")
+        target_group_info = self._get_target_group_info()
+        
+        if not target_group_info:
+            return target_health
+            
+        try:
+            client = boto3.client("elbv2")
+        except NoRegionError as error:
+            if self.region_name is None:
+                logger.error("%s", error)
+                return target_health
             else:
-                logger.debug("targetgroup_arn: %s" % targetgroup_arn)
-                try:
-                    target_health = client.describe_target_health(
-                        TargetGroupArn=targetgroup_arn
-                    )
-                except Exception as error:
-                    logger.error("Could not get target health: %s", error)
+                client = boto3.client(
+                    "elbv2",
+                    region_name=self.region_name,
+                )
+                
+        targetgroup_arn = target_group_info.get("arn")
+        if not targetgroup_arn:
+            return target_health
+            
+        logger.debug("targetgroup_arn: %s" % targetgroup_arn)
+        try:
+            target_health_response = client.describe_target_health(
+                TargetGroupArn=targetgroup_arn
+            )
+            # Store target type with the health response
+            target_health = {
+                "TargetHealthDescriptions": target_health_response.get("TargetHealthDescriptions", []),
+                "TargetType": target_group_info.get("type")
+            }
+        except Exception as error:
+            logger.error("Could not get target health: %s", error)
+            
         return target_health
 
     def get_healty_instances(self):
         healty_instances = []
         target_health = self._get_target_health()
         if target_health:
-            logger.debug("Instance health states: %s", target_health)
+            logger.debug("Target health states: %s", target_health)
             try:
                 healty_instances = sorted(
                     x["Target"]["Id"]
-                    for x in target_health.get("TargetHealthDescriptions")
+                    for x in target_health.get("TargetHealthDescriptions", [])
                     if x["TargetHealth"]["State"] == "healthy"
                 )
             except Exception as error:
                 logger.error("Could not parse healty_instances: %s", error)
             else:
                 logger.info(
-                    "Healty instances: %s", ", ".join(healty_instances)
+                    "Healty instances/IPs: %s", ", ".join(healty_instances)
                 )
         return healty_instances
+        
+    def _is_master(self, healty_instances):
+        """Determine if this instance is the master based on target type"""
+        if not healty_instances:
+            return False
+            
+        target_health = self._get_target_health()
+        target_type = target_health.get("TargetType")
+        
+        logger.debug("Determining master with target type: %s", target_type)
+        
+        if target_type == "instance":
+            # For instance-type targets, use instance ID
+            if self.instance_id:
+                return self.instance_id == healty_instances[0]
+        elif target_type == "ip":
+            # For IP-type targets, use eth0 IP
+            if self.eth0_ip:
+                return self.eth0_ip == healty_instances[0]
+        else:
+            logger.warning("Unknown target type: %s", target_type)
+            
+        return False
