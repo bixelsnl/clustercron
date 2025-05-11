@@ -12,6 +12,8 @@ Modules holds base class for AWS ElasticLoadBalancing classes
 from __future__ import unicode_literals
 
 import logging
+import socket
+import subprocess
 
 import boto.utils
 
