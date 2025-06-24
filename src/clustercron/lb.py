@@ -46,28 +46,52 @@ class Lb(object):
         
     def _get_eth0_ip(self):
         """Get the IPv4 address of the eth0 interface"""
-        try:
-            # Try to get the IP using the 'ip' command
-            result = subprocess.check_output(
-                ["ip", "-4", "-o", "addr", "show", "dev", "eth0", "scope", "global"],
-                universal_newlines=True
-            )
-            # Parse the output to extract the IP address
-            if result:
-                ip_parts = result.strip().split()
-                for i, part in enumerate(ip_parts):
-                    if part == "inet":
-                        # Format is typically: inet 172.31.8.112/20 ...
-                        return ip_parts[i+1].split("/")[0]
-        except (subprocess.CalledProcessError, IndexError, FileNotFoundError) as error:
-            logger.warning("Could not get eth0 IP using ip command: %s", error)
+        import shutil
+        import os
+        
+        # Try to find the ip command in the PATH or at common locations
+        ip_cmd = shutil.which('ip')
+        
+        # If not found in PATH, try common locations
+        if not ip_cmd:
+            common_paths = ['/usr/sbin/ip', '/sbin/ip']
+            for path in common_paths:
+                if os.path.isfile(path) and os.access(path, os.X_OK):
+                    ip_cmd = path
+                    break
+        
+        if ip_cmd:
+            try:
+                # Try to get the IP using the located ip command
+                result = subprocess.check_output(
+                    [ip_cmd, "-4", "-o", "addr", "show", "dev", "eth0", "scope", "global"],
+                    universal_newlines=True
+                )
+                # Parse the output to extract the IP address
+                if result:
+                    ip_parts = result.strip().split()
+                    for i, part in enumerate(ip_parts):
+                        if part == "inet":
+                            # Format is typically: inet 172.31.8.112/20 ...
+                            return ip_parts[i+1].split("/")[0]
+            except (subprocess.CalledProcessError, IndexError) as error:
+                logger.warning("Could not get eth0 IP using %s command: %s", ip_cmd, error)
+            except FileNotFoundError:
+                logger.warning("IP command not found at %s", ip_cmd)
+        else:
+            logger.error("Could not find 'ip' command in PATH or common locations. This is required for proper IP detection.")
+
             
         # Fallback method using socket
         try:
             # Get all network interfaces
             hostname = socket.gethostname()
             ip_address = socket.gethostbyname(hostname)
-            return ip_address
+            # Verify this is not a loopback address before returning
+            if ip_address != "127.0.0.1":
+                return ip_address
+            else:
+                logger.warning("Socket returned loopback address 127.0.0.1, which is not a valid eth0 IP")
         except Exception as error:
             logger.error("Could not get eth0 IP: %s", error)
             
@@ -80,6 +104,18 @@ class Lb(object):
         logger.debug("Check if instance is master")
         if self.instance_id is None and self.eth0_ip is None:
             logger.error("No Instance Id or IP address available")
+            return False
+        
+        # For IP-based target groups, a valid eth0 IP is critical
+        if self.eth0_ip is None:
+            logger.error("Failed to determine eth0 IP address. This is required for proper operation.")
+            # We return False here instead of raising an exception to maintain compatibility
+            # The main module will handle the exit code
+            return False
+            
+        # Reject loopback addresses as they're not valid for AWS target groups
+        if self.eth0_ip == "127.0.0.1":
+            logger.error("Invalid eth0 IP detected: 127.0.0.1. This will not work with AWS target groups.")
             return False
             
         healty_instances = self.get_healty_instances()
